@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="389" viewBox="0 0 780 389" role="img" aria-label="Animated terminal: codex-acct list shows the main account at its limit, codex-acct auto switches the running session to the second account, codex-acct status confirms it.">
+<title>codex-acct demo</title>
+<style>
+text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+        font-size: 14px; white-space: pre; }
+.l { opacity: 0; animation-duration: 17.0s; animation-iteration-count: infinite; }
+.cur { animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .l { animation: none; opacity: 1; }
+  .c { animation: none; transform: translateX(780px); }
+}@keyframes s0 { 0%, 2.353% { opacity: 0; } 2.412%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r0 { animation-name: s0; }@keyframes t0 { 0%, 2.353% { transform: translateX(0); animation-timing-function: steps(15, end); } 7.206%, 100% { transform: translateX(128.4px); } }#c0 { animation: t0 17.0s infinite; }@keyframes s1 { 0%, 10.147% { opacity: 0; } 10.206%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r1 { animation-name: s1; }@keyframes s2 { 0%, 10.853% { opacity: 0; } 10.912%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r2 { animation-name: s2; }@keyframes s3 { 0%, 11.559% { opacity: 0; } 11.618%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r3 { animation-name: s3; }@keyframes s4 { 0%, 18.618% { opacity: 0; } 18.676%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r4 { animation-name: s4; }@keyframes s5 { 0%, 18.618% { opacity: 0; } 18.676%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r5 { animation-name: s5; }@keyframes t5 { 0%, 18.618% { transform: translateX(0); animation-timing-function: steps(15, end); } 23.471%, 100% { transform: translateX(128.4px); } }#c5 { animation: t5 17.0s infinite; }@keyframes s6 { 0%, 26.412% { opacity: 0; } 26.471%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r6 { animation-name: s6; }@keyframes s7 { 0%, 31.706% { opacity: 0; } 31.765%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r7 { animation-name: s7; }@keyframes s8 { 0%, 39.353% { opacity: 0; } 39.412%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r8 { animation-name: s8; }@keyframes s9 { 0%, 39.353% { opacity: 0; } 39.412%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r9 { animation-name: s9; }@keyframes t9 { 0%, 39.353% { transform: translateX(0); animation-timing-function: steps(17, end); } 44.853%, 100% { transform: translateX(145.3px); } }#c9 { animation: t9 17.0s infinite; }@keyframes s10 { 0%, 47.794% { opacity: 0; } 47.853%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r10 { animation-name: s10; }@keyframes s11 { 0%, 48.265% { opacity: 0; } 48.324%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r11 { animation-name: s11; }@keyframes s12 { 0%, 48.735% { opacity: 0; } 48.794%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r12 { animation-name: s12; }@keyframes s13 { 0%, 49.206% { opacity: 0; } 49.265%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r13 { animation-name: s13; }@keyframes s14 { 0%, 52.147% { opacity: 0; } 52.206%, 91.765% { opacity: 1; } 95.294%, 100% { opacity: 0; } }#r14 { animation-name: s14; }
+</style>
+<rect width="780" height="389" rx="10" fill="#0d1117" stroke="#30363d"/>
+<circle cx="22" cy="20" r="6" fill="#ff5f57"/><circle cx="42" cy="20" r="6" fill="#febc2e"/><circle cx="62" cy="20" r="6" fill="#28c840"/>
+<text x="390.0" y="25" fill="#7d8590" text-anchor="middle" style="font-size:12px">codex-acct — hot-switch when the limit hits</text>
+<line x1="0" y1="38" x2="780" y2="38" stroke="#30363d"/>
+<g id="r0" class="l"><text x="22" y="67" fill="#3fb950" font-weight="bold">$</text><text x="38.86" y="67"><tspan fill="#e6edf3">codex-acct list</tspan></text><rect id="c0" class="c" x="37.86" y="53" width="780" height="21" fill="#0d1117"/></g>
+<g id="r1" class="l"><text x="22" y="88"><tspan fill="#7d8590">   ACCOUNT  EMAIL                PLAN   USAGE</tspan></text></g>
+<g id="r2" class="l"><text x="22" y="109"><tspan fill="#d29922" font-weight="bold">*  </tspan><tspan fill="#e6edf3">main     me@example.com       plus   </tspan><tspan fill="#f85149" font-weight="bold">LIMIT</tspan></text></g>
+<g id="r3" class="l"><text x="22" y="130"><tspan fill="#e6edf3">   second   me.alt@example.com   plus   </tspan><tspan fill="#3fb950">12% used</tspan></text></g>
+<g id="r5" class="l"><text x="22" y="172" fill="#3fb950" font-weight="bold">$</text><text x="38.86" y="172"><tspan fill="#e6edf3">codex-acct auto</tspan></text><rect id="c5" class="c" x="37.86" y="158" width="780" height="21" fill="#0d1117"/></g>
+<g id="r6" class="l"><text x="22" y="193"><tspan fill="#7d8590">[codex-acct] using &#x27;second&#x27; (12% used)</tspan></text></g>
+<g id="r7" class="l"><text x="22" y="214"><tspan fill="#3fb950" font-weight="bold">✓ </tspan><tspan fill="#e6edf3">switched to &#x27;second&#x27; (me.alt@example.com), session still running</tspan></text></g>
+<g id="r9" class="l"><text x="22" y="256" fill="#3fb950" font-weight="bold">$</text><text x="38.86" y="256"><tspan fill="#e6edf3">codex-acct status</tspan></text><rect id="c9" class="c" x="37.86" y="242" width="780" height="21" fill="#0d1117"/></g>
+<g id="r10" class="l"><text x="22" y="277"><tspan fill="#7d8590">email   : </tspan><tspan fill="#e6edf3">me.alt@example.com</tspan></text></g>
+<g id="r11" class="l"><text x="22" y="298"><tspan fill="#7d8590">plan    : </tspan><tspan fill="#e6edf3">plus</tspan></text></g>
+<g id="r12" class="l"><text x="22" y="319"><tspan fill="#7d8590">usage   : </tspan><tspan fill="#3fb950">12% used</tspan></text></g>
+<g id="r13" class="l"><text x="22" y="340"><tspan fill="#7d8590">limited : </tspan><tspan fill="#3fb950">False</tspan></text></g>
+<g id="r14" class="l"><text x="22" y="361" fill="#3fb950" font-weight="bold">$</text><rect class="cur" x="38.86" y="349" width="8.43" height="17" fill="#e6edf3"/></g>
+</svg>

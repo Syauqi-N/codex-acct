@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""
+codex-acct - run several Codex CLI accounts on one shared history.
+
+When one account hits its usage limit, keep going on another account
+without logging out, logging back in, or losing the conversation.
+
+Usage:
+  codex-acct add <name>          register an account (opens the browser to log in)
+  codex-acct list                list accounts with email, plan and usage
+  codex-acct use <name>          set the default account
+  codex-acct share               merge every account's history into one
+  codex-acct run [--acct <name>] [codex args]
+                                 run codex with the default (or given) account
+  codex-acct resume [--acct <name>] [id]
+                                 resume a session, whichever account created it
+  codex-acct auto [codex args]   use the first account that still has quota
+  codex-acct serve [--port N] [name]
+                                 start a websocket app-server for hot-switching
+  codex-acct tui [codex args]    open a TUI connected to that server
+  codex-acct switch <name>       hot-switch the running session to another account
+  codex-acct status              show the account active on the running server
+
+How it works:
+  Every account gets its own CODEX_HOME (~/.codex, ~/.codex-<name>, ...) with
+  its own auth.json. `share` symlinks the history files of every account to
+  ~/.codex, so any account can resume any session. `switch` hands another
+  account's token to a running app-server through the experimental
+  `account/login/start` (chatgptAuthTokens) RPC, so the live thread keeps
+  going under the new identity.
+"""
+import base64
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from contextlib import closing
+
+VERSION = "0.1.0"
+
+ROOT = os.path.expanduser("~/.codex")
+REGISTRY = os.path.join(ROOT, "accounts.json")
+STATE = os.path.join(ROOT, "acct-state.json")
+DEFAULT_PORT = 8791
+
+# History shared between accounts so a session can be resumed from any of them.
+SHARED = [
+    "sessions",
+    "session_index.jsonl",
+    "state_5.sqlite",
+    "thread_history_1.sqlite",
+]
+
+# Tables merged when two accounts both already have their own database.
+SQLITE_TABLES = {
+    "state_5.sqlite": ["threads"],
+    "thread_history_1.sqlite": [
+        "thread_items", "thread_turns", "thread_history_projection_state",
+    ],
+}
+
+CLIENT_INFO = {"name": "codex-acct", "version": VERSION}
+
+
+# ---------------------------------------------------------------- helpers ---
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load_registry():
+    reg = read_json(REGISTRY)
+    if reg is None:
+        reg = {"default": "main", "accounts": {"main": ROOT}}
+        write_json(REGISTRY, reg)
+    return reg
+
+
+def home_of(reg, name):
+    if name not in reg["accounts"]:
+        die(f"unknown account '{name}'. See: codex-acct list")
+    return reg["accounts"][name]
+
+
+def pop_acct(args, reg):
+    """Strip a leading `--acct <name>` / `-a <name>` from args."""
+    if args and args[0] in ("--acct", "-a"):
+        if len(args) < 2:
+            die(f"{args[0]} needs an account name")
+        return args[1], args[2:]
+    return reg.get("default"), args
+
+
+def codex_env(home, **extra):
+    env = dict(os.environ)
+    env["CODEX_HOME"] = home
+    env.update(extra)
+    return env
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def codex_processes():
+    """Command lines of running Codex processes (TUI, exec, app-server...)."""
+    out = subprocess.run(["ps", "-eo", "pid=,args="],
+                         capture_output=True, text=True).stdout
+    found = []
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        argv = args.split()
+        if not argv or pid == str(os.getpid()):
+            continue
+        exe = os.path.basename(argv[0])
+        script = os.path.basename(argv[1]) if len(argv) > 1 else ""
+        if exe == "codex" or (exe == "node" and script == "codex"):
+            found.append(args)
+    return found
+
+
+# -------------------------------------------------------------- app-server ---
+
+def find_server():
+    """Return (ws_url, token) of the server started by `codex-acct serve`."""
+    url = os.environ.get("CODEX_ACCT_WS")
+    if url:
+        return url, os.environ.get("CODEX_ACCT_TOKEN", "")
+
+    st = read_json(STATE, {})
+    url, tokfile, pid = st.get("ws_url"), st.get("token_file"), st.get("pid")
+    if not url or not tokfile:
+        return None
+    if pid and not pid_alive(pid):
+        return None
+    try:
+        with open(tokfile) as f:
+            return url, f.read().strip()
+    except OSError:
+        return None
+
+
+class Rpc:
+    """Minimal JSON-RPC client for the app-server websocket.
+
+    Python's stdlib has no websocket client, so this talks to the server
+    through a small Node bridge (codex-acct-ws.js) over stdin/stdout.
+    """
+
+    def __init__(self, ws_url, token=""):
+        self.ws_url = ws_url
+        self.token = token
+        self.next_id = 0
+
+    def __enter__(self):
+        here = os.path.dirname(os.path.realpath(__file__))
+        bridge = os.path.join(here, "codex-acct-ws.js")
+        if not os.path.exists(bridge):
+            die(f"bridge not found: {bridge}")
+        self.proc = subprocess.Popen(
+            ["node", bridge, self.ws_url, self.token],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
+        )
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        self.proc.kill()
+        self.proc.wait()
+
+    def _send(self, msg):
+        try:
+            self.proc.stdin.write(json.dumps(msg) + "\n")
+            self.proc.stdin.flush()
+        except BrokenPipeError:
+            err = self.proc.stderr.read().strip()
+            die(f"lost connection to {self.ws_url}: {err or 'bridge exited'}\n"
+                "Is the server running? Start it with: codex-acct serve")
+
+    def call(self, method, params=None, timeout=30):
+        self.next_id += 1
+        mid = self.next_id
+        self._send({"jsonrpc": "2.0", "id": mid, "method": method,
+                    "params": params or {}})
+        end = time.time() + timeout
+        while time.time() < end:
+            line = self.proc.stdout.readline()
+            if not line:
+                return None
+            try:
+                m = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if m.get("id") == mid:
+                return m
+        return None
+
+    def notify(self, method, params=None):
+        self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+    def handshake(self):
+        r = self.call("initialize", {"clientInfo": CLIENT_INFO,
+                                     "capabilities": {"experimentalApi": True}})
+        self.notify("initialized", {})
+        return r
+
+
+def query_account(home, timeout=25):
+    """Read email, plan and usage of one account with a throwaway app-server."""
+    reqs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"clientInfo": CLIENT_INFO,
+                    "capabilities": {"experimentalApi": True}}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "account/read", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read", "params": {}},
+    ]
+    out = {"email": None, "plan": None, "used": None, "logged_in": False,
+           "limit_reached": False, "error": None}
+    replies = {}
+    try:
+        proc = subprocess.Popen(
+            ["codex", "app-server"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=codex_env(home), text=True,
+        )
+    except OSError as e:
+        out["error"] = str(e)
+        return out
+
+    # readline() blocks, so a timer enforces the deadline.
+    watchdog = threading.Timer(timeout, proc.kill)
+    watchdog.start()
+    try:
+        proc.stdin.write("".join(json.dumps(r) + "\n" for r in reqs))
+        proc.stdin.flush()
+        while len(replies) < 2:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                m = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if m.get("id") in (2, 3):
+                replies[m["id"]] = m
+    except OSError as e:
+        out["error"] = str(e)
+    finally:
+        watchdog.cancel()
+        proc.kill()
+        proc.wait()
+
+    for m in replies.values():
+        if "error" in m:
+            out["error"] = (m["error"] or {}).get("message")
+    acct = (replies.get(2, {}).get("result") or {}).get("account") or {}
+    out["email"] = acct.get("email")
+    out["plan"] = acct.get("planType")
+    out["logged_in"] = acct.get("type") in ("chatgpt", "apiKey")
+    rl = replies.get(3, {}).get("result") or {}
+    out["used"] = ((rl.get("rateLimits") or {}).get("primary") or {}).get("usedPercent")
+    out["limit_reached"] = rl.get("ordinaryUsageAllowed") is False
+    if not replies and not out["error"]:
+        out["error"] = "no reply from codex app-server"
+    return out
+
+
+def plan_from_id_token(id_token):
+    """chatgpt_plan_type claim of an id_token, or None to let Codex derive it."""
+    try:
+        payload = id_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims.get("https://api.openai.com/auth", {}).get("chatgpt_plan_type")
+    except (IndexError, ValueError, AttributeError):
+        return None
+
+
+# ------------------------------------------------------------------ share ---
+
+def merge_sqlite(dst, src, item):
+    """Copy rows from src into dst without overwriting existing rows.
+
+    Returns the number of rows added, or None if the database is unknown or
+    the merge failed (src is then left untouched).
+    """
+    if not os.path.exists(dst):
+        with closing(sqlite3.connect(src)) as s, closing(sqlite3.connect(dst)) as d:
+            s.backup(d)
+        return sum_rows(dst, SQLITE_TABLES.get(item, []))
+
+    tables = SQLITE_TABLES.get(item)
+    if not tables:
+        return None
+    added = 0
+    with closing(sqlite3.connect(dst)) as con:
+        try:
+            con.execute("ATTACH DATABASE ? AS src", (src,))
+            for t in tables:
+                exists = con.execute(
+                    "SELECT count(*) FROM src.sqlite_master WHERE type='table' AND name=?",
+                    (t,)).fetchone()[0]
+                if not exists:
+                    continue
+                before = con.execute(f"SELECT count(*) FROM main.{t}").fetchone()[0]
+                con.execute(f"INSERT OR IGNORE INTO main.{t} SELECT * FROM src.{t}")
+                after = con.execute(f"SELECT count(*) FROM main.{t}").fetchone()[0]
+                added += after - before
+            con.commit()
+            con.execute("DETACH DATABASE src")
+        except sqlite3.Error as e:
+            print(f"    ! merge failed: {e}")
+            return None
+    return added
+
+
+def sum_rows(db, tables):
+    with closing(sqlite3.connect(db)) as con:
+        total = 0
+        for t in tables:
+            try:
+                total += con.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+            except sqlite3.Error:
+                pass
+        return total
+
+
+def merge_dir(dst, src):
+    """Move files from src into dst. Files already in dst are kept aside.
+
+    Returns (moved, kept_aside_path_or_None).
+    """
+    moved = 0
+    for root, _dirs, files in os.walk(src):
+        for fn in files:
+            sp = os.path.join(root, fn)
+            dp = os.path.join(dst, os.path.relpath(sp, src))
+            if os.path.exists(dp):
+                continue
+            os.makedirs(os.path.dirname(dp), exist_ok=True)
+            shutil.move(sp, dp)
+            moved += 1
+    leftovers = any(files for _r, _d, files in os.walk(src))
+    if leftovers:
+        aside = f"{src}.unmerged-{time.strftime('%Y%m%d-%H%M%S')}"
+        os.rename(src, aside)
+        return moved, aside
+    shutil.rmtree(src)
+    return moved, None
+
+
+def merge_lines(dst, src):
+    """Append lines of src that dst does not have yet. Returns lines added."""
+    with open(dst) as f:
+        have = set(f.read().splitlines())
+    with open(src) as f:
+        new = [ln for ln in f.read().splitlines() if ln and ln not in have]
+    if new:
+        with open(dst, "a") as f:
+            for ln in new:
+                f.write(ln + "\n")
+    return len(new)
+
+
+def share_item(home, item):
+    """Merge one history item of `home` into ROOT and symlink it back."""
+    src = os.path.join(home, item)
+    dst = os.path.join(ROOT, item)
+
+    if os.path.islink(src):
+        return "already shared"
+
+    if not os.path.exists(src):
+        msg = "linked"
+    elif os.path.isdir(src):
+        if not os.path.exists(dst):
+            shutil.move(src, dst)
+            msg = "moved to main home"
+        else:
+            moved, aside = merge_dir(dst, src)
+            msg = f"{moved} file(s) merged into main home"
+            if aside:
+                msg += f"; duplicates kept in {aside}"
+    elif item.endswith(".sqlite"):
+        added = merge_sqlite(dst, src, item)
+        if added is None:
+            return "could not merge, left separate"
+        msg = f"{added} row(s) merged into main home"
+        os.remove(src)
+        for suf in ("-wal", "-shm"):
+            if os.path.exists(src + suf):
+                os.remove(src + suf)
+    else:
+        if not os.path.exists(dst):
+            shutil.move(src, dst)
+            msg = "moved to main home"
+        else:
+            msg = f"{merge_lines(dst, src)} line(s) merged into main home"
+            os.remove(src)
+
+    os.symlink(dst, src)
+    return msg
+
+
+# ---------------------------------------------------------------- commands ---
+
+def cmd_list(args):
+    reg = load_registry()
+    default = reg.get("default")
+    print(f"{'':2} {'ACCOUNT':12} {'EMAIL':30} {'PLAN':7} {'USAGE':10} HOME")
+    for name, home in reg["accounts"].items():
+        info = query_account(home)
+        mark = "*" if name == default else " "
+        email = (info["email"] or "-")[:30]
+        plan = (info["plan"] or "-")[:7]
+        if not info["logged_in"]:
+            usage = "no-login"
+        elif info["limit_reached"]:
+            usage = "LIMIT"
+        elif info["used"] is not None:
+            usage = f"{info['used']}% used"
+        else:
+            usage = "-"
+        print(f"{mark:2} {name:12} {email:30} {plan:7} {usage:10} {home}")
+    return 0
+
+
+def cmd_add(args):
+    if not args:
+        die("usage: codex-acct add <name>")
+    name = args[0]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        die("account name may only contain letters, digits, '.', '_' and '-'")
+    reg = load_registry()
+    if name in reg["accounts"]:
+        die(f"account '{name}' already exists")
+    home = os.path.expanduser(f"~/.codex-{name}")
+    os.makedirs(home, exist_ok=True)
+    cfg = os.path.join(ROOT, "config.toml")
+    if os.path.exists(cfg) and not os.path.exists(os.path.join(home, "config.toml")):
+        shutil.copy2(cfg, os.path.join(home, "config.toml"))
+    print(f"logging in account '{name}' (a browser window will open)...")
+    if subprocess.call(["codex", "login"], env=codex_env(home)) != 0:
+        die("login failed or was cancelled")
+    reg["accounts"][name] = home
+    write_json(REGISTRY, reg)
+    print(f"\ndone. account '{name}' registered.")
+    print("  share history : codex-acct share")
+    print(f"  use it now    : codex-acct run --acct {name}")
+    return 0
+
+
+def do_switch(name, reg):
+    """Hand the tokens of account `name` to the running app-server."""
+    home = home_of(reg, name)
+    auth = read_json(os.path.join(home, "auth.json"))
+    if not auth:
+        die(f"account '{name}' is not logged in (no auth.json). Run: codex-acct add {name}")
+    if auth.get("auth_mode") != "chatgpt":
+        die(f"account '{name}' uses auth mode '{auth.get('auth_mode')}'. "
+            "Hot-switch only works with ChatGPT login.")
+
+    tokens = auth.get("tokens") or {}
+    access = tokens.get("access_token")
+    account_id = tokens.get("account_id")
+    if not access or not account_id:
+        die(f"tokens of account '{name}' are incomplete")
+
+    server = find_server()
+    if not server:
+        die("no app-server is running, so there is no live session to switch.\n"
+            "\n"
+            "Hot-switch flow:\n"
+            "  terminal 1 : codex-acct serve\n"
+            "  terminal 2 : codex-acct tui\n"
+            "  terminal 3 : codex-acct switch <name>\n"
+            "\n"
+            "Or start codex once with a specific account:\n"
+            f"  codex-acct run --acct {name}")
+
+    url, token = server
+    with Rpc(url, token) as r:
+        r.handshake()
+        res = r.call("account/login/start", {
+            "type": "chatgptAuthTokens",
+            "accessToken": access,
+            "chatgptAccountId": account_id,
+            "chatgptPlanType": plan_from_id_token(tokens.get("id_token") or ""),
+        })
+        if not res or "error" in res:
+            die(f"switch failed: {(res or {}).get('error', {}).get('message', 'no response')}")
+        chk = r.call("account/read")
+        acct = ((chk or {}).get("result") or {}).get("account") or {}
+
+    reg["default"] = name
+    write_json(REGISTRY, reg)
+    print(f"✓ switched to '{name}' ({acct.get('email') or '?'}), session still running")
+    return 0
+
+
+def cmd_switch(args):
+    reg = load_registry()
+    if not args:
+        names = list(reg["accounts"])
+        if len(names) < 2:
+            die("only one account so far. Add one with: codex-acct add <name>")
+        print("accounts:")
+        for i, n in enumerate(names, 1):
+            mark = " (active)" if n == reg.get("default") else ""
+            print(f"  {i}. {n}{mark}")
+        die("usage: codex-acct switch <name>")
+    return do_switch(args[0], reg)
+
+
+def pick_available(reg):
+    """First account (default first) that is logged in and has quota left."""
+    default = reg.get("default")
+    order = [default] + [n for n in reg["accounts"] if n != default]
+    for name in order:
+        if name not in reg["accounts"]:
+            continue
+        info = query_account(reg["accounts"][name])
+        if info["logged_in"] and not info["limit_reached"]:
+            return name, info
+    return None, None
+
+
+def cmd_auto(args):
+    """Use an account that still has quota.
+
+    With a running app-server  -> hot-switch the live session.
+    Without                    -> start codex with that account.
+    """
+    reg = load_registry()
+    name, info = pick_available(reg)
+    if not name:
+        die("every account is rate-limited or logged out")
+    print(f"[codex-acct] using '{name}' ({info['used']}% used)", file=sys.stderr)
+
+    if find_server():
+        return do_switch(name, reg)
+
+    reg["default"] = name
+    write_json(REGISTRY, reg)
+    return subprocess.call(["codex"] + args, env=codex_env(home_of(reg, name)))
+
+
+def cmd_status(args):
+    server = find_server()
+    if not server:
+        die("no app-server is running (start one with: codex-acct serve)")
+    with Rpc(*server) as r:
+        r.handshake()
+        a = r.call("account/read")
+        rl = r.call("account/rateLimits/read")
+    acct = ((a or {}).get("result") or {}).get("account") or {}
+    res = (rl or {}).get("result") or {}
+    prim = (res.get("rateLimits") or {}).get("primary") or {}
+    print(f"email   : {acct.get('email')}")
+    print(f"plan    : {acct.get('planType')}")
+    print(f"usage   : {prim.get('usedPercent')}% used")
+    print(f"limited : {res.get('ordinaryUsageAllowed') is False}")
+    return 0
+
+
+def cmd_share(args):
+    """Merge the history of every account into ~/.codex and symlink it back."""
+    reg = load_registry()
+    others = [(n, h) for n, h in reg["accounts"].items()
+              if os.path.realpath(h) != os.path.realpath(ROOT)]
+    if not others:
+        die("no other accounts yet. Add one with: codex-acct add <name>")
+
+    running = codex_processes()
+    if running:
+        print("Codex is still running:")
+        for line in running[:5]:
+            print("  " + line[:100])
+        die("close every Codex session before running share.\n"
+            "Background daemons can be stopped with:\n"
+            "  CODEX_HOME=<home> codex app-server daemon stop")
+
+    os.makedirs(ROOT, exist_ok=True)
+    for name, home in others:
+        print(f"\n[{name}] {home}")
+        for item in SHARED:
+            print(f"  {item:24} {share_item(home, item)}")
+
+    print("\n✓ done. every account now shares the same history.")
+    print("  try: codex-acct resume <session-id>  (from any account)")
+    return 0
+
+
+def cmd_use(args):
+    if not args:
+        die("usage: codex-acct use <name>")
+    reg = load_registry()
+    home_of(reg, args[0])
+    reg["default"] = args[0]
+    write_json(REGISTRY, reg)
+    print(f"default -> {args[0]}")
+    return 0
+
+
+def cmd_run(args):
+    reg = load_registry()
+    name, args = pop_acct(args, reg)
+    return subprocess.call(["codex"] + args, env=codex_env(home_of(reg, name)))
+
+
+def cmd_resume(args):
+    reg = load_registry()
+    name, args = pop_acct(args, reg)
+    return subprocess.call(["codex", "resume"] + args, env=codex_env(home_of(reg, name)))
+
+
+def cmd_serve(args):
+    """Run a websocket app-server so a TUI can attach and be hot-switched."""
+    reg = load_registry()
+    port = str(DEFAULT_PORT)
+    if "--port" in args:
+        i = args.index("--port")
+        if i + 1 >= len(args):
+            die("--port needs a value")
+        port = args[i + 1]
+        args = args[:i] + args[i + 2:]
+    name = args[0] if args else reg.get("default")
+    home = home_of(reg, name)
+
+    tokfile = os.path.join(ROOT, "acct-ws-token")
+    fd = os.open(tokfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("codex-acct-" + os.urandom(16).hex())
+
+    url = f"ws://127.0.0.1:{port}"
+    write_json(STATE, {"ws_url": url, "token_file": tokfile,
+                       "pid": os.getpid(), "account": name, "port": port})
+
+    print(f"app-server : {url}   (starting account: {name})")
+    print(f"token file : {tokfile}")
+    print("")
+    print("open the TUI in another terminal : codex-acct tui")
+    print("switch account at any time       : codex-acct switch <name>")
+    print("stop the server                  : Ctrl-C")
+    sys.stdout.flush()
+    try:
+        return subprocess.call([
+            "codex", "app-server", "--listen", url,
+            "--ws-auth", "capability-token", "--ws-token-file", tokfile,
+        ], env=codex_env(home))
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if read_json(STATE, {}).get("token_file") == tokfile:
+            write_json(STATE, {})
+
+
+def cmd_tui(args):
+    """Open a TUI attached to the `serve` app-server, so it can be hot-switched."""
+    reg = load_registry()
+    server = find_server()
+    if not server:
+        die("no app-server is running.\n"
+            "  terminal 1: codex-acct serve\n"
+            "  terminal 2: codex-acct tui")
+    url, token = server
+    name = read_json(STATE, {}).get("account") or reg.get("default")
+    return subprocess.call([
+        "codex", "--remote", url,
+        "--remote-auth-token-env", "CODEX_ACCT_TOKEN",
+    ] + args, env=codex_env(home_of(reg, name), CODEX_ACCT_TOKEN=token))
+
+
+COMMANDS = {
+    "list": cmd_list, "ls": cmd_list,
+    "add": cmd_add,
+    "use": cmd_use,
+    "share": cmd_share,
+    "run": cmd_run,
+    "resume": cmd_resume,
+    "auto": cmd_auto,
+    "serve": cmd_serve,
+    "tui": cmd_tui,
+    "switch": cmd_switch, "sw": cmd_switch,
+    "status": cmd_status,
+}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] in ("-V", "--version", "version"):
+        print(f"codex-acct {VERSION}")
+        return 0
+    cmd = COMMANDS.get(argv[0])
+    if not cmd:
+        die(f"unknown command: {argv[0]}. See: codex-acct help")
+    return cmd(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
